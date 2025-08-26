@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# file: line_follow_with_chess.py
+
+import cv2
+import numpy as np
+import argparse
+import sys
+import time
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+def connect_arduino(port, baud):
+    if port in (None, "", "none"):
+        print("[INFO] 아두이노 전송 비활성화(--port none)")
+        return None
+    if serial is None:
+        print("[WARN] pyserial 미설치. 전송 없이 실행됩니다. (pip3 install pyserial)")
+        return None
+    try:
+        ser = serial.Serial(port, baud, timeout=0.02)
+        time.sleep(2)
+        print(f"[OK] 아두이노 연결 성공: {port} @ {baud}")
+        return ser
+    except Exception as e:
+        print(f"[WARN] 아두이노 연결 실패: {e}")
+        return None
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def main():
+    parser = argparse.ArgumentParser()
+    # 카메라
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--width", type=int, default=320)
+    parser.add_argument("--height", type=int, default=240)
+    parser.add_argument("--show_bin", action="store_true")
+    parser.add_argument("--no_gui", action="store_true")
+    # 이진화
+    parser.add_argument("--th", type=int, default=150)
+    parser.add_argument("--use_hsv", action="store_true")
+    # ROI/조향
+    parser.add_argument("--roi_top", type=float, default=0.6)
+    parser.add_argument("--deadband", type=int, default=30)
+    parser.add_argument("--smooth_k", type=int, default=21)
+    parser.add_argument("--min_colsum", type=float, default=5.0)
+    # PWM 파라미터
+    parser.add_argument("--base", type=int, default=120)
+    parser.add_argument("--maxpwm", type=int, default=200)
+    parser.add_argument("--kp", type=float, default=0.6)
+    # 시리얼
+    parser.add_argument("--port", type=str, default="/dev/ttyACM0")
+    parser.add_argument("--baud", type=int, default=9600)
+    # 체커보드 인식
+    parser.add_argument("--chess_cols", type=int, default=7, help="체커보드 내부 코너 열 수")
+    parser.add_argument("--chess_rows", type=int, default=7, help="체커보드 내부 코너 행 수")
+    args = parser.parse_args()
+
+    arduino = connect_arduino(args.port, args.baud)
+
+    cap = cv2.VideoCapture(args.device)
+    if not cap.isOpened():
+        print(f"[ERROR] 카메라 열기 실패(/dev/video{args.device})")
+        sys.exit(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    print("[OK] 카메라 연결 성공 | 종료: q")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        h, w = frame.shape[:2]
+
+        # --- 체커보드 인식 ---
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        found, corners = cv2.findChessboardCorners(gray, (args.chess_cols, args.chess_rows), None)
+
+        if found:
+            # 코너 그리기
+            cv2.drawChessboardCorners(frame, (args.chess_cols, args.chess_rows), corners, found)
+            cv2.putText(frame, "CHECKERBOARD DETECTED", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # 아두이노에 멈춤 신호 전송
+            if arduino:
+                try:
+                    msg = "L0 R0\n"
+                    arduino.write(msg.encode())
+                except:
+                    pass
+
+            # 화면만 보여주고 이번 루프는 스킵
+            if not args.no_gui:
+                cv2.imshow("frame", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            continue
+
+        # --- 라인 이진화 ---
+        if args.use_hsv:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            binary = cv2.inRange(hsv, (0, 0, 200), (179, 60, 255))
+        else:
+            _, binary = cv2.threshold(gray, args.th, 255, cv2.THRESH_BINARY)
+
+        # ROI
+        y0 = int(h * args.roi_top)
+        roi = binary[y0:, :]
+        white_count = int(np.count_nonzero(roi == 255))
+
+        # 열합 기반 좌/우 라인 검출
+        col_sum = np.count_nonzero(roi == 255, axis=0).astype(np.float32)
+        k = args.smooth_k if args.smooth_k % 2 == 1 else args.smooth_k + 1
+        if k > 1:
+            ker = np.ones(k, dtype=np.float32) / k
+            col_smooth = np.convolve(col_sum, ker, mode="same")
+        else:
+            col_smooth = col_sum
+
+        left_region  = col_smooth[: w // 2]
+        right_region = col_smooth[w // 2 :]
+
+        left_idx = int(np.argmax(left_region)) if left_region.size > 0 else None
+        right_idx_half = int(np.argmax(right_region)) if right_region.size > 0 else None
+        right_idx = (w // 2 + right_idx_half) if right_idx_half is not None else None
+
+        ok_left  = (left_idx  is not None) and (left_region[left_idx]        >= args.min_colsum)
+        ok_right = (right_idx is not None) and (right_region[right_idx_half] >= args.min_colsum)
+
+        lane_center = None
+        dev = 0
+        direction = 'X'
+
+        if ok_left and ok_right:
+            lane_center = (left_idx + right_idx) // 2
+            dev = lane_center - (w // 2)
+            if dev < -args.deadband: direction = 'L'
+            elif dev > args.deadband: direction = 'R'
+            else: direction = 'S'
+        else:
+            pts = cv2.findNonZero(roi)
+            if pts is not None and len(pts) > 0:
+                cx = int(np.mean(pts[:, 0, 0]))
+                dev = cx - (w // 2)
+                if dev < -args.deadband: direction = 'L'
+                elif dev > args.deadband: direction = 'R'
+                else: direction = 'S'
+            else:
+                direction = 'X'
+
+        # PWM 계산
+        if direction == 'X':
+            left_pwm = right_pwm = int(args.base * 0.6)
+        else:
+            steer = args.kp * dev
+            left_pwm  = int(clamp(args.base + steer, -args.maxpwm, args.maxpwm))
+            right_pwm = int(clamp(args.base - steer, -args.maxpwm, args.maxpwm))
+
+        # 아두이노 전송
+        if arduino:
+            try:
+                msg = f"L{left_pwm} R{right_pwm}\n"
+                arduino.write(msg.encode())
+            except:
+                pass
+
+        # 시각화
+        if not args.no_gui:
+            vis = frame.copy()
+            cv2.rectangle(vis, (0, y0), (w, h), (255, 0, 0), 2)
+            cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 0), 1)
+            if lane_center is not None:
+                cv2.line(vis, (lane_center, y0), (lane_center, h), (0, 0, 255), 2)
+            cv2.putText(vis, f"dir:{direction} dev:{dev}", (10, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            cv2.imshow("frame", vis)
+
+            if args.show_bin:
+                cv2.imshow("binary", binary)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    cap.release()
+    if not args.no_gui:
+        cv2.destroyAllWindows()
+    if arduino:
+        try: arduino.close()
+        except: pass
+
+if __name__ == "__main__":
+    main()

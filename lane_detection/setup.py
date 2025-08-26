@@ -20,7 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'lane_detect_camera = lane_detection.lane_detect_camera_node:main',
+            'line_follow = lane_detection.line_follow:main',
         ],
     },
 )
